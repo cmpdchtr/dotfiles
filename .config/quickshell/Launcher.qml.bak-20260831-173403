@@ -2,47 +2,12 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick
-import QtQuick.Effects
 
 Scope {
     id: launcher
 
     property bool open: false
     property int selectedIndex: 0
-
-    // `p` carries the springy curve for the card's geometry and may overshoot
-    // past 1; `rowP` is a plain linear ramp, used only to cascade the app rows,
-    // because the springy curve is far too front-loaded to stagger against.
-    property real p: 0
-    property real rowP: 0
-
-    function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
-    function outCubic(v) { let t = launcher.clamp01(v); return 1 - Math.pow(1 - t, 3); }
-    function rowReveal(index) { return launcher.outCubic((launcher.rowP - index * 0.045) / 0.38); }
-
-    // Restarted from the changed handler so `to`, `duration` and `easing` are
-    // all re-read after `open` has already flipped.
-    onOpenChanged: launcherAnim.restart()
-
-    ParallelAnimation {
-        id: launcherAnim
-        NumberAnimation {
-            target: launcher
-            property: "p"
-            to: launcher.open ? 1 : 0
-            duration: launcher.open ? 430 : 190
-            easing.type: launcher.open ? Easing.OutBack : Easing.InCubic
-            easing.overshoot: 1.45
-        }
-        NumberAnimation {
-            target: launcher
-            property: "rowP"
-            to: launcher.open ? 1 : 0
-            duration: launcher.open ? 520 : 110
-            easing.type: Easing.Linear
-        }
-    }
-
     property var filteredApps: {
         let query = searchInput.text.trim().toLowerCase();
         let apps = DesktopEntries.applications.values.filter(app => {
@@ -101,23 +66,13 @@ Scope {
     PanelWindow {
         id: launcherWindow
         screen: Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
-        // Stays mapped for the length of the close animation; the mask below is
-        // what actually stops it swallowing clicks on the way out.
-        visible: launcher.open || launcher.p > 0.001
+        visible: launcher.open
         anchors { top: true; bottom: true; left: true; right: true }
         exclusiveZone: 0
-        color: "transparent"
+        color: "#52000000"
         WlrLayershell.keyboardFocus: launcher.open ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
 
-        mask: Region { Region { item: launcher.open ? dismissArea : null } }
-
-        // The dim used to be the window's own colour, which meant it snapped in
-        // and out. As an item it can fade with everything else.
-        Rectangle {
-            anchors.fill: parent
-            color: "#000000"
-            opacity: 0.32 * launcher.clamp01(launcher.p)
-        }
+        mask: Region { Region { item: dismissArea } }
 
         MouseArea {
             id: dismissArea
@@ -125,39 +80,21 @@ Scope {
             onClicked: launcher.hide()
         }
 
-        RectangularShadow {
-            z: 1
-            anchors.fill: card
-            radius: card.radius
-            blur: 52
-            spread: 4
-            offset.y: 16
-            color: "#B4000000"
-            opacity: card.opacity
-            visible: card.visible
-        }
-
         Rectangle {
             id: card
-            z: 2
             anchors.horizontalCenter: parent.horizontalCenter
-            y: Math.max(70, parent.height * 0.18) - 28 * (1 - launcher.p)
+            y: Math.max(70, parent.height * 0.18)
             width: 620
             height: 76 + Math.max(1, Math.min(8, launcher.filteredApps.length)) * 62 + 18
             radius: 14
             color: "#F21E1D1E"
             border.width: 1
             border.color: "#55FFFFFF"
-            opacity: launcher.clamp01(launcher.p * 1.7)
-            scale: 0.9 + 0.1 * launcher.p
-            visible: launcher.p > 0.001
-            clip: true
+            opacity: launcher.open ? 1 : 0
+            scale: launcher.open ? 1 : 0.94
 
-            // Same curve and duration as the list below, so the card and its
-            // contents resize as one while the query is being typed.
-            Behavior on height {
-                NumberAnimation { duration: 260; easing.type: Easing.OutQuint }
-            }
+            Behavior on opacity { NumberAnimation { duration: 130; easing.type: Easing.OutQuad } }
+            Behavior on scale { NumberAnimation { duration: 180; easing.type: Easing.OutBack; easing.overshoot: 1.03 } }
 
             MouseArea { anchors.fill: parent; onClicked: mouse => mouse.accepted = true }
 
@@ -171,10 +108,6 @@ Scope {
                 color: "#20FFFFFF"
                 border.width: 1
                 border.color: searchInput.activeFocus ? "#65FFFFFF" : "#25FFFFFF"
-
-                Behavior on border.color {
-                    ColorAnimation { duration: 180 }
-                }
 
                 Text {
                     anchors.left: parent.left; anchors.leftMargin: 15
@@ -227,45 +160,15 @@ Scope {
                 model: launcher.filteredApps
                 currentIndex: launcher.selectedIndex
 
-                Behavior on height {
-                    NumberAnimation { duration: 260; easing.type: Easing.OutQuint }
-                }
-
-                // Driven by hand rather than by ListView so the selection can
-                // glide with a spring instead of the built-in linear slide.
-                highlightFollowsCurrentItem: false
-                highlight: Rectangle {
-                    width: appList.width
-                    height: appList.currentItem ? appList.currentItem.height : 58
-                    y: appList.currentItem ? appList.currentItem.y : 0
-                    radius: 10
-                    color: "#2AFFFFFF"
-                    border.width: 1
-                    border.color: "#38FFFFFF"
-                    opacity: launcher.clamp01(launcher.p * 1.5)
-
-                    Behavior on y {
-                        NumberAnimation { duration: 300; easing.type: Easing.OutBack; easing.overshoot: 1.7 }
-                    }
-                }
-
                 delegate: Rectangle {
                         required property var modelData
                         required property int index
                         width: appList.width
                         height: 58
                         radius: 10
-                        // Selection itself is drawn by the gliding highlight
-                        // behind the rows; this is hover only.
-                        color: appMouse.containsMouse && index !== launcher.selectedIndex
-                            ? "#1AFFFFFF"
-                            : "transparent"
-                        opacity: launcher.rowReveal(index)
-                        transform: Translate { y: (1 - launcher.rowReveal(index)) * 22 }
-
-                        Behavior on color {
-                            ColorAnimation { duration: 140 }
-                        }
+                        color: index === launcher.selectedIndex ? "#2FFFFFFF" : (appMouse.containsMouse ? "#1FFFFFFF" : "transparent")
+                        border.width: index === launcher.selectedIndex ? 1 : 0
+                        border.color: "#35FFFFFF"
 
                         Image {
                             id: appIcon
@@ -276,11 +179,6 @@ Scope {
                             visible: source.toString() !== ""
                             fillMode: Image.PreserveAspectFit
                             asynchronous: true
-                            scale: appMouse.containsMouse ? 1.14 : 1
-
-                            Behavior on scale {
-                                NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.8 }
-                            }
                         }
 
                         Text {

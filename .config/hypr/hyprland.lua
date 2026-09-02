@@ -31,7 +31,7 @@ hl.monitor({
 local terminal    = "ghostty"
 local fileManager = "nautilus"
 local menu        = "qs ipc call launcher toggle"
-local browser     = "helium"
+local browser     = "helium-browser"
 
 -------------------
 ---- AUTOSTART ----
@@ -289,3 +289,10 @@ hl.window_rule({
     move  = "20 monitor_h-120",
     float = true,
 })
+
+hl.window_rule({
+    name  = "windscribe-float",
+    match = { class = "[Ww]indscribe" },
+    float = true,
+})
+

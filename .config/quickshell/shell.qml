@@ -2,6 +2,8 @@ import Quickshell
 import Quickshell.Wayland
 import Quickshell.Io
 import Quickshell.Hyprland
+import Quickshell.Networking
+import Quickshell.Bluetooth
 import Quickshell.Services.Notifications
 import QtQuick
 import QtQuick.Effects
@@ -28,12 +30,12 @@ Scope {
             id: root
             required property var modelData
             screen: modelData
-            WlrLayershell.keyboardFocus: root.wifiPasswordOpen
+            WlrLayershell.keyboardFocus: root.subPanel === "wifiPassword"
                 ? WlrKeyboardFocus.Exclusive
                 : WlrKeyboardFocus.None
 
-            onWifiPasswordOpenChanged: {
-                if (root.wifiPasswordOpen) {
+            onSubPanelChanged: {
+                if (root.subPanel === "wifiPassword") {
                     Qt.callLater(() => wifiPasswordInput.forceActiveFocus());
                 }
             }
@@ -179,9 +181,94 @@ Scope {
                 }
             }
 
-            // Network status
-            property string netIcon: "󰈀"
-            property string netType: "Ethernet"
+            // Network state comes straight off NetworkManager through
+            // Quickshell.Networking instead of a polled `nmcli` pipeline. The
+            // device list, signal strengths and connection states are all live
+            // properties, which is the thing the old panel was missing: nothing
+            // ever asked for a rescan, so the list it showed was whatever
+            // NetworkManager happened to have cached.
+            readonly property var wifiDevice: {
+                for (let d of Networking.devices.values) if (d.type === DeviceType.Wifi) return d;
+                return null;
+            }
+            readonly property var wiredDevice: {
+                for (let d of Networking.devices.values) if (d.type === DeviceType.Wired) return d;
+                return null;
+            }
+            readonly property var wiredNetwork: root.wiredDevice ? root.wiredDevice.network : null
+            readonly property bool ethernetAvailable: root.wiredDevice !== null
+            readonly property bool ethernetConnected: root.wiredDevice ? root.wiredDevice.connected : false
+            readonly property bool wifiOn: Networking.wifiEnabled
+            readonly property bool wifiConnected: root.wifiDevice ? root.wifiDevice.connected : false
+
+            // Quickshell already folds the access points of one SSID into a
+            // single Network, so this only has to order them: live first, then
+            // saved, then by signal strength.
+            readonly property var wifiNetworks: {
+                if (!root.wifiDevice) return [];
+                let list = root.wifiDevice.networks.values.filter(n => n.name !== "");
+                list.sort((a, b) => {
+                    if (a.connected !== b.connected) return a.connected ? -1 : 1;
+                    if (a.known !== b.known) return a.known ? -1 : 1;
+                    return b.signalStrength - a.signalStrength;
+                });
+                return list;
+            }
+            readonly property var activeWifiNetwork: {
+                for (let n of root.wifiNetworks) if (n.connected) return n;
+                return null;
+            }
+
+            readonly property string netIcon: root.ethernetConnected
+                ? "󰈀"
+                : (!root.wifiOn
+                    ? "󰤭"
+                    : (root.wifiConnected ? root.signalGlyph(root.activeWifiNetwork) : "󰤯"))
+            readonly property string netType: root.ethernetConnected
+                ? "Ethernet"
+                : (!root.wifiOn
+                    ? "Off"
+                    : (root.activeWifiNetwork ? root.activeWifiNetwork.name : "Disconnected"))
+
+            // signalStrength is a 0..1 double, not a percentage.
+            function signalGlyph(net) {
+                if (!net) return "󰤯";
+                let s = net.signalStrength;
+                if (s > 0.75) return "󰤨";
+                if (s > 0.5) return "󰤥";
+                if (s > 0.25) return "󰤢";
+                return "󰤟";
+            }
+
+            function signalPercent(net) {
+                return net ? Math.round(net.signalStrength * 100) : 0;
+            }
+
+            // Rows are a fixed height, so a scrolling list can size itself to
+            // however many it is allowed to show at once.
+            function listHeight(count, rowHeight, gap, maxRows) {
+                let rows = Math.max(1, Math.min(maxRows, count));
+                return rows * rowHeight + (rows - 1) * gap;
+            }
+
+            // Bluetooth is native too, so pairing state, battery level and
+            // connection progress are per-device properties rather than
+            // something scraped out of `bluetoothctl`.
+            readonly property var btAdapter: Bluetooth.defaultAdapter
+            readonly property bool btAvailable: root.btAdapter !== null
+            readonly property bool btOn: root.btAdapter ? root.btAdapter.enabled : false
+            readonly property bool btScanning: root.btAdapter ? root.btAdapter.discovering : false
+            readonly property var btDevices: {
+                if (!root.btAdapter || !Bluetooth.devices) return [];
+                let list = Bluetooth.devices.values.slice();
+                list.sort((a, b) => {
+                    if (a.connected !== b.connected) return a.connected ? -1 : 1;
+                    if (a.paired !== b.paired) return a.paired ? -1 : 1;
+                    return a.name.localeCompare(b.name);
+                });
+                return list;
+            }
+            readonly property int btConnectedCount: root.btDevices.filter(d => d.connected).length
 
             // Media and screen recording. Missing optional tools degrade to an
             // explanatory empty state instead of leaving dead controls.
@@ -193,11 +280,6 @@ Scope {
             property string mediaPlayerName: "Media"
             property string mediaArtUrl: ""
             property var mediaPlayers: []
-            property var wifiNetworks: []
-            property bool mediaSelectorOpen: false
-            property bool wifiSelectorOpen: false
-            property bool wifiPasswordOpen: false
-            property string pendingWifiSsid: ""
             property bool mediaAvailable: false
             property int mediaMisses: 0
             property bool isRecording: false
@@ -207,15 +289,18 @@ Scope {
             property int mediaLength: 0
             property int gpuPercent: 0
             property int batteryPercent: -1
-            property bool wifiEnabled: true
-            property bool ethernetAvailable: false
-            property bool ethernetConnected: false
-            property string ethernetDevice: ""
-            property bool bluetoothAvailable: false
-            property bool bluetoothBlocked: false
             property string recordMode: "screen"
             property bool recordAudio: false
             property int recordSeconds: 0
+
+            // One slot instead of three mutually-exclusive booleans. The old
+            // trio could reach states like "Wi-Fi list open behind a password
+            // prompt for a network the list no longer contains".
+            property string subPanel: ""
+            readonly property bool subPanelOpen: root.subPanel !== ""
+            property var pendingWifiNetwork: null
+            property string wifiError: ""
+            property string btError: ""
 
             function formatMediaTime(seconds) {
                 let value = Math.max(0, Math.floor(seconds));
@@ -235,57 +320,69 @@ Scope {
                 mediaPositionRefresh.restart();
             }
 
-            function toggleWifi() {
-                Quickshell.execDetached(["nmcli", "radio", "wifi", root.wifiEnabled ? "off" : "on"]);
-                wifiPollProc.running = true;
+            function toggleWifiRadio() {
+                root.wifiError = "";
+                Networking.wifiEnabled = !Networking.wifiEnabled;
             }
 
             function toggleEthernet() {
-                if (!root.ethernetDevice) return;
-                Quickshell.execDetached(["nmcli", "device", root.ethernetConnected ? "disconnect" : "connect", root.ethernetDevice]);
-                netPollProc.running = true;
-                ethernetPollDelay.restart();
+                if (!root.wiredNetwork) return;
+                if (root.wiredNetwork.connected) root.wiredNetwork.disconnect();
+                else root.wiredNetwork.connect();
             }
 
             function openWifiManager() {
-                root.wifiSelectorOpen = false;
-                root.mediaSelectorOpen = false;
+                root.subPanel = "";
                 root.commandCenterOpen = false;
                 Quickshell.execDetached(["nm-connection-editor"]);
             }
 
             function selectMediaPlayer(service) {
                 root.preferredMediaService = service;
-                root.mediaSelectorOpen = false;
+                root.subPanel = "";
                 mediaPollProc.running = true;
             }
 
-            function connectWifi(ssid, active, security, savedId) {
-                if (active) return;
-                if (savedId) {
-                    Quickshell.execDetached(["nmcli", "connection", "up", "id", savedId]);
-                    root.wifiSelectorOpen = false;
+            // A saved or open network can be brought straight up; an unknown
+            // secured one needs a passphrase first. Either way NetworkManager
+            // reports back through Network.connectionFailed, so a wrong password
+            // now surfaces in the panel instead of failing silently.
+            function activateWifi(net) {
+                if (!net) return;
+                root.wifiError = "";
+                if (net.connected) {
+                    net.disconnect();
                     return;
                 }
-                if (security && security !== "--") {
-                    root.pendingWifiSsid = ssid;
-                    root.wifiPasswordOpen = true;
-                    wifiPasswordInput.text = "";
-                    wifiPasswordInput.forceActiveFocus();
+                if (net.known || net.security === WifiSecurityType.Open) {
+                    net.connect();
                     return;
                 }
-                Quickshell.execDetached(["nmcli", "device", "wifi", "connect", ssid]);
-                root.wifiSelectorOpen = false;
-                wifiListRefresh.restart();
+                root.pendingWifiNetwork = net;
+                wifiPasswordInput.text = "";
+                root.subPanel = "wifiPassword";
             }
 
             function submitWifiPassword() {
-                if (!root.pendingWifiSsid || !wifiPasswordInput.text) return;
-                Quickshell.execDetached(["nmcli", "device", "wifi", "connect", root.pendingWifiSsid, "password", wifiPasswordInput.text]);
+                if (!root.pendingWifiNetwork || !wifiPasswordInput.text) return;
+                root.wifiError = "";
+                root.pendingWifiNetwork.connectWithPsk(wifiPasswordInput.text);
                 wifiPasswordInput.text = "";
-                root.wifiPasswordOpen = false;
-                root.wifiSelectorOpen = false;
-                wifiListRefresh.restart();
+                root.subPanel = "wifi";
+            }
+
+            function forgetWifi(net) {
+                if (!net || !net.known) return;
+                root.wifiError = "";
+                net.forget();
+            }
+
+            function wifiStatusText(net) {
+                if (!net) return "";
+                if (net.stateChanging) return ConnectionState.toString(net.state) + "\u2026";
+                if (net.connected) return "Connected \u00b7 click to disconnect";
+                let sec = WifiSecurityType.toString(net.security);
+                return net.known ? "Saved \u00b7 " + sec : sec;
             }
 
             function cycleMediaPlayer() {
@@ -293,9 +390,63 @@ Scope {
             }
 
             function toggleBluetooth() {
-                if (!root.bluetoothAvailable) return;
-                Quickshell.execDetached(["rfkill", root.bluetoothBlocked ? "unblock" : "block", "bluetooth"]);
-                bluetoothPollProc.running = true;
+                if (!root.btAdapter) return;
+                root.btError = "";
+                root.btAdapter.enabled = !root.btAdapter.enabled;
+            }
+
+            // One click does the next sensible thing, so the row never needs a
+            // separate pair/connect/disconnect control.
+            function btDeviceAction(dev) {
+                if (!dev) return;
+                root.btError = "";
+                if (dev.pairing) dev.cancelPair();
+                else if (dev.connected) dev.disconnect();
+                else if (dev.paired || dev.bonded) dev.connect();
+                else dev.pair();
+            }
+
+            function btForget(dev) {
+                if (!dev) return;
+                root.btError = "";
+                dev.forget();
+            }
+
+            // BlueZ reports battery as a percentage on some devices and a 0..1
+            // fraction on others; normalise before showing it.
+            function btBatteryPercent(dev) {
+                if (!dev || !dev.batteryAvailable) return -1;
+                let b = dev.battery;
+                return Math.round(b <= 1 ? b * 100 : b);
+            }
+
+            function btGlyph(dev) {
+                let icon = (dev && dev.icon) ? dev.icon.toLowerCase() : "";
+                if (icon.includes("headset")) return "󰋎";
+                if (icon.includes("headphone")) return "󰋋";
+                if (icon.includes("speaker") || icon.includes("audio")) return "󰓃";
+                if (icon.includes("phone")) return "󰄜";
+                if (icon.includes("mouse") || icon.includes("pointing")) return "󰍽";
+                if (icon.includes("keyboard")) return "󰌌";
+                if (icon.includes("computer") || icon.includes("laptop")) return "󰌢";
+                if (icon.includes("watch")) return "󰔠";
+                if (icon.includes("printer")) return "󰐪";
+                if (icon.includes("gaming") || icon.includes("joystick")) return "󰺵";
+                if (icon.includes("display") || icon.includes("video")) return "󰍹";
+                return "󰂯";
+            }
+
+            function btStatusText(dev) {
+                if (!dev) return "";
+                if (dev.pairing) return "Pairing\u2026 \u00b7 click to cancel";
+                if (dev.state === BluetoothDeviceState.Connecting) return "Connecting\u2026";
+                if (dev.state === BluetoothDeviceState.Disconnecting) return "Disconnecting\u2026";
+                if (dev.connected) {
+                    let battery = root.btBatteryPercent(dev);
+                    return battery >= 0 ? "Connected \u00b7 " + battery + "%" : "Connected";
+                }
+                if (dev.paired || dev.bonded) return "Paired \u00b7 click to connect";
+                return "Click to pair";
             }
 
             function openBtop() {
@@ -391,26 +542,63 @@ Scope {
                         id: selectorOverlay
                         z: 20
                         width: 390
-                        height: root.wifiPasswordOpen ? 180 : (root.mediaSelectorOpen
-                            ? 53 + Math.max(1, Math.min(6, root.mediaPlayers.length)) * 60
-                            : 53 + (root.ethernetAvailable ? 54 : 0)
-                                + Math.max(48, Math.min(6, root.wifiNetworks.length) * 54) + 50)
+
+                        // Height follows the body's implicit height rather than a
+                        // hand-summed constant, so adding a row to any panel can
+                        // no longer leave the card the wrong size. Kept separate
+                        // from `height` so the Command Centre card can animate
+                        // towards the same target on the same curve.
+                        readonly property real naturalHeight: 43 + panelBody.implicitHeight + 12
+
+                        height: naturalHeight
+                        Behavior on height {
+                            NumberAnimation { duration: 340; easing.type: Easing.OutQuint }
+                        }
+
                         anchors.horizontalCenter: parent.horizontalCenter
                         y: commandCenterCard.y + 10
                         radius: 9
                         color: "#FC1E1D1E"
                         border.width: 1
                         border.color: "#45FFFFFF"
-                        visible: root.commandCenterOpen
-                            && (root.mediaSelectorOpen || root.wifiSelectorOpen)
+                        clip: true
+                        transformOrigin: Item.Top
+                        scale: 0.95 + 0.05 * root.selProgress
+                        // Gated on the card's progress as well, so a sub-panel is
+                        // never caught painting over the bar while the card behind
+                        // it is still smaller than the island.
+                        opacity: root.selProgress * root.clamp01((root.ccProgress - 0.12) / 0.5)
+                        visible: opacity > 0.01
 
                         Text {
                             anchors.left: parent.left; anchors.leftMargin: 14
                             anchors.top: parent.top; anchors.topMargin: 13
-                            text: root.wifiPasswordOpen ? "CONNECT TO WI-FI" : (root.mediaSelectorOpen ? "MEDIA PLAYERS" : "WI-FI NETWORKS")
+                            text: root.subPanel === "wifiPassword"
+                                ? "CONNECT TO WI-FI"
+                                : (root.subPanel === "media"
+                                    ? "MEDIA PLAYERS"
+                                    : (root.subPanel === "bluetooth" ? "BLUETOOTH" : "WI-FI NETWORKS"))
                             color: root.colActive
                             font { family: root.fontFamily; pixelSize: 10; bold: true; letterSpacing: 1.2 }
                         }
+
+                        // Live scan indicator. Both lists only scan while they are
+                        // on screen, so this doubles as a reason the list is short.
+                        Text {
+                            anchors.left: parent.left; anchors.leftMargin: 150
+                            anchors.top: parent.top; anchors.topMargin: 13
+                            visible: (root.subPanel === "wifi" && root.wifiOn)
+                                || (root.subPanel === "bluetooth" && root.btScanning)
+                            text: "󰍉 SCANNING"
+                            color: root.colMuted
+                            font { family: root.fontFamily; pixelSize: 8; bold: true; letterSpacing: 1.1 }
+                            SequentialAnimation on opacity {
+                                running: true; loops: Animation.Infinite
+                                NumberAnimation { to: 0.35; duration: 900; easing.type: Easing.InOutQuad }
+                                NumberAnimation { to: 1.0; duration: 900; easing.type: Easing.InOutQuad }
+                            }
+                        }
+
                         Rectangle {
                             id: selectorCloseButton
                             z: 100
@@ -418,150 +606,566 @@ Scope {
                             anchors.top: parent.top; anchors.topMargin: 8
                             width: 28; height: 28; radius: 8
                             color: selectorCloseMouse.containsMouse ? "#28FFFFFF" : "transparent"
-                            Text { anchors.centerIn: parent; text: "󰅖"; color: selectorCloseMouse.containsMouse ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 13 } }
-                            MouseArea { id: selectorCloseMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onPressed: mouse => { mouse.accepted = true; root.mediaSelectorOpen = false; root.wifiSelectorOpen = false; root.wifiPasswordOpen = false; } }
-                        }
-
-                        Column {
-                            anchors.left: parent.left; anchors.right: parent.right
-                            anchors.top: parent.top; anchors.topMargin: 43
-                            anchors.margins: 10; spacing: 6
-                            visible: root.mediaSelectorOpen
-
-                            Repeater {
-                                model: root.mediaPlayers
-                                Rectangle {
-                                    required property var modelData
-                                    width: parent.width; height: 54; radius: 9
-                                    color: modelData.service === root.mediaService ? "#30FFFFFF" : (playerChoiceMouse.containsMouse ? "#24FFFFFF" : "#10FFFFFF")
-                                    border.width: 1; border.color: modelData.service === root.mediaService ? "#55FFFFFF" : "#18FFFFFF"
-                                    Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.status === "Playing" ? "󰐊" : "󰏤"; color: modelData.status === "Playing" ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 15 } }
-                                    Column { anchors.left: parent.left; anchors.leftMargin: 42; anchors.verticalCenter: parent.verticalCenter; spacing: 2; Text { text: modelData.name; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } } Text { text: modelData.status; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8 } } }
-                                    Text { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.service === root.mediaService ? "󰄬" : "󰅂"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 12 } }
-                                    MouseArea { id: playerChoiceMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.selectMediaPlayer(modelData.service) }
-                                }
-                            }
-                        }
-
-                        Column {
-                            anchors.left: parent.left; anchors.right: parent.right
-                            anchors.top: parent.top; anchors.topMargin: 43
-                            anchors.margins: 10; spacing: 6
-                            visible: root.wifiSelectorOpen && !root.wifiPasswordOpen
-
-                            Rectangle {
-                                width: parent.width; height: 48; radius: 9
-                                visible: root.ethernetAvailable
-                                color: root.ethernetConnected ? "#28FFFFFF" : "#10FFFFFF"; border.width: 1; border.color: root.ethernetConnected ? "#45FFFFFF" : "#18FFFFFF"
-                                Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: "󰈀"; color: root.ethernetConnected ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 15 } }
-                                Column { anchors.left: parent.left; anchors.leftMargin: 42; anchors.verticalCenter: parent.verticalCenter; spacing: 2; Text { text: "Ethernet"; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } } Text { text: root.ethernetConnected ? "Connected · click to disconnect" : "Disconnected · click to reconnect"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8 } } }
-                                Text { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: root.ethernetConnected ? "󰄬" : "󰅂"; color: root.ethernetConnected ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 12 } }
-                                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleEthernet() }
-                            }
-
-                            Flickable {
-                                width: parent.width
-                                height: Math.max(48, Math.min(6, root.wifiNetworks.length) * 54)
-                                contentWidth: width
-                                contentHeight: wifiNetworkColumn.implicitHeight
-                                clip: true
-                                boundsBehavior: Flickable.StopAtBounds
-                                flickableDirection: Flickable.VerticalFlick
-
-                                Column {
-                                    id: wifiNetworkColumn
-                                    width: parent.width
-                                    spacing: 6
-
-                                    Text {
-                                        width: parent.width; height: 48
-                                        visible: root.wifiNetworks.length === 0
-                                        verticalAlignment: Text.AlignVCenter
-                                        horizontalAlignment: Text.AlignHCenter
-                                        text: root.wifiEnabled ? "No Wi-Fi networks found" : "Wi-Fi is disabled"
-                                        color: root.colMuted
-                                        font { family: root.fontFamily; pixelSize: 9 }
-                                    }
-
-                                    Repeater {
-                                        model: root.wifiNetworks
-                                        Rectangle {
-                                            required property var modelData
-                                            width: wifiNetworkColumn.width; height: 48; radius: 9
-                                            color: modelData.active ? "#30FFFFFF" : (wifiChoiceMouse.containsMouse ? "#24FFFFFF" : "#10FFFFFF")
-                                            border.width: 1; border.color: modelData.active ? "#55FFFFFF" : "#18FFFFFF"
-                                            Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.signal > 70 ? "󰤨" : (modelData.signal > 35 ? "󰤥" : "󰤟"); color: modelData.active ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 15 } }
-                                            Text { anchors.left: parent.left; anchors.leftMargin: 42; anchors.right: wifiSignal.left; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter; text: modelData.ssid; elide: Text.ElideRight; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } }
-                                            Text { id: wifiSignal; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: (modelData.security && modelData.security !== "--" ? "󰌾  " : "") + modelData.signal + "%"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8; bold: true } }
-                                            MouseArea { id: wifiChoiceMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.connectWifi(modelData.ssid, modelData.active, modelData.security, modelData.savedId) }
-                                        }
-                                    }
-                                }
-
-                                Rectangle {
-                                    anchors.right: parent.right
-                                    width: 3
-                                    height: parent.height * Math.min(1, parent.height / Math.max(1, parent.contentHeight))
-                                    y: parent.contentY * parent.height / Math.max(1, parent.contentHeight)
-                                    radius: 2
-                                    color: "#55FFFFFF"
-                                    visible: parent.contentHeight > parent.height
-                                }
-                            }
-
-                            Rectangle {
-                                width: parent.width; height: 38; radius: 9
-                                color: wifiSettingsMouse.containsMouse ? "#24FFFFFF" : "#10FFFFFF"; border.width: 1; border.color: "#18FFFFFF"
-                                Text { anchors.centerIn: parent; text: "󰒓  Advanced network settings"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 9; bold: true } }
-                                MouseArea { id: wifiSettingsMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.openWifiManager() }
-                            }
-                        }
-
-                        Column {
-                            anchors.left: parent.left; anchors.right: parent.right
-                            anchors.top: parent.top; anchors.topMargin: 48
-                            anchors.leftMargin: 14; anchors.rightMargin: 14
-                            spacing: 9
-                            visible: root.wifiPasswordOpen
-
+                            scale: selectorCloseMouse.pressed ? 0.86 : 1
+                            Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutBack; easing.overshoot: 3 } }
                             Text {
-                                width: parent.width
-                                text: "Password for " + root.pendingWifiSsid
-                                elide: Text.ElideRight
-                                color: root.colFg
-                                font { family: root.fontFamily; pixelSize: 10; bold: true }
+                                anchors.centerIn: parent
+                                text: root.subPanel === "wifiPassword" ? "󰅁" : "󰅖"
+                                color: selectorCloseMouse.containsMouse ? root.colActive : root.colMuted
+                                font { family: root.fontFamily; pixelSize: 13 }
                             }
-                            Rectangle {
-                                width: parent.width; height: 38; radius: 9
-                                color: "#18FFFFFF"; border.width: 1
-                                border.color: wifiPasswordInput.activeFocus ? "#66FFFFFF" : "#25FFFFFF"
-                                TextInput {
-                                    id: wifiPasswordInput
-                                    anchors.fill: parent; anchors.leftMargin: 11; anchors.rightMargin: 11
-                                    verticalAlignment: TextInput.AlignVCenter
-                                    echoMode: TextInput.Password
-                                    passwordCharacter: "•"
-                                    color: root.colActive
-                                    selectionColor: "#55FFFFFF"
-                                    font { family: root.fontFamily; pixelSize: 10 }
-                                    Keys.onReturnPressed: root.submitWifiPassword()
-                                    Keys.onEnterPressed: root.submitWifiPassword()
+                            MouseArea {
+                                id: selectorCloseMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                // The password prompt is a step inside the Wi-Fi
+                                // panel, so its close button steps back rather
+                                // than dismissing the whole thing.
+                                onPressed: mouse => {
+                                    mouse.accepted = true;
+                                    root.subPanel = root.subPanel === "wifiPassword" ? "wifi" : "";
                                 }
+                            }
+                        }
+
+                        Column {
+                            id: panelBody
+                            anchors.left: parent.left; anchors.right: parent.right
+                            anchors.top: parent.top; anchors.topMargin: 43
+                            anchors.leftMargin: 10; anchors.rightMargin: 10
+                            spacing: 6
+
+                            // ── Media players ───────────────────────────────
+                            Column {
+                                width: parent.width
+                                spacing: 6
+                                visible: root.subPanel === "media"
+
+                                Repeater {
+                                    model: root.mediaPlayers
+                                    Rectangle {
+                                        required property var modelData
+                                        width: parent.width; height: 54; radius: 9
+                                        color: modelData.service === root.mediaService ? "#30FFFFFF" : (playerChoiceMouse.containsMouse ? "#24FFFFFF" : "#10FFFFFF")
+                                        border.width: 1; border.color: modelData.service === root.mediaService ? "#55FFFFFF" : "#18FFFFFF"
+                                        Behavior on color { ColorAnimation { duration: 140 } }
+                                        Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.status === "Playing" ? "󰐊" : "󰏤"; color: modelData.status === "Playing" ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 15 } }
+                                        Column { anchors.left: parent.left; anchors.leftMargin: 42; anchors.verticalCenter: parent.verticalCenter; spacing: 2; Text { text: modelData.name; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } } Text { text: modelData.status; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8 } } }
+                                        Text { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.service === root.mediaService ? "󰄬" : "󰅂"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 12 } }
+                                        MouseArea { id: playerChoiceMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.selectMediaPlayer(modelData.service) }
+                                    }
+                                }
+
                                 Text {
-                                    anchors.left: parent.left; anchors.leftMargin: 11; anchors.verticalCenter: parent.verticalCenter
-                                    visible: wifiPasswordInput.text === "" && !wifiPasswordInput.activeFocus
-                                    text: "Enter network password"
+                                    width: parent.width; height: 54
+                                    visible: root.mediaPlayers.length === 0
+                                    verticalAlignment: Text.AlignVCenter
+                                    horizontalAlignment: Text.AlignHCenter
+                                    text: "No MPRIS players running"
                                     color: root.colMuted
                                     font { family: root.fontFamily; pixelSize: 9 }
                                 }
-                                MouseArea { anchors.fill: parent; z: -1; onClicked: wifiPasswordInput.forceActiveFocus() }
                             }
-                            Rectangle {
-                                width: parent.width; height: 36; radius: 9
-                                color: wifiConnectMouse.containsMouse ? "#35FFFFFF" : "#24FFFFFF"
-                                border.width: 1; border.color: "#45FFFFFF"
-                                Text { anchors.centerIn: parent; text: "Connect"; color: root.colActive; font { family: root.fontFamily; pixelSize: 9; bold: true } }
-                                MouseArea { id: wifiConnectMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.submitWifiPassword() }
+
+                            // ── Wi-Fi ───────────────────────────────────────
+                            Column {
+                                width: parent.width
+                                spacing: 6
+                                visible: root.subPanel === "wifi"
+
+                                // The radio switch the old panel never had: the
+                                // tile could report "Disabled" with no way to
+                                // turn the adapter back on.
+                                Rectangle {
+                                    width: parent.width; height: 48; radius: 9
+                                    color: wifiRadioMouse.containsMouse ? "#2CFFFFFF" : (root.wifiOn ? "#20FFFFFF" : "#10FFFFFF")
+                                    border.width: 1; border.color: root.wifiOn ? "#40FFFFFF" : "#18FFFFFF"
+                                    Behavior on color { ColorAnimation { duration: 140 } }
+                                    Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: root.wifiOn ? "󰖩" : "󰤭"; color: root.wifiOn ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 15 } }
+                                    Column {
+                                        anchors.left: parent.left; anchors.leftMargin: 42; anchors.verticalCenter: parent.verticalCenter; spacing: 2
+                                        Text { text: "Wi-Fi"; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } }
+                                        Text { text: root.wifiOn ? (root.activeWifiNetwork ? root.activeWifiNetwork.name : "On · not connected") : "Off"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8 } }
+                                    }
+                                    // Pill switch, so on/off reads at a glance.
+                                    Rectangle {
+                                        anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                                        width: 34; height: 18; radius: 9
+                                        color: root.wifiOn ? "#66FFFFFF" : "#28FFFFFF"
+                                        Behavior on color { ColorAnimation { duration: 180 } }
+                                        Rectangle {
+                                            y: 3; width: 12; height: 12; radius: 6
+                                            x: root.wifiOn ? 19 : 3
+                                            color: root.wifiOn ? "#1E1D1E" : root.colMuted
+                                            Behavior on x { NumberAnimation { duration: 260; easing.type: Easing.OutBack; easing.overshoot: 2.2 } }
+                                            Behavior on color { ColorAnimation { duration: 180 } }
+                                        }
+                                    }
+                                    MouseArea { id: wifiRadioMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleWifiRadio() }
+                                }
+
+                                Rectangle {
+                                    width: parent.width; height: 48; radius: 9
+                                    visible: root.ethernetAvailable
+                                    color: ethernetMouse.containsMouse ? "#2CFFFFFF" : (root.ethernetConnected ? "#20FFFFFF" : "#10FFFFFF")
+                                    border.width: 1; border.color: root.ethernetConnected ? "#40FFFFFF" : "#18FFFFFF"
+                                    Behavior on color { ColorAnimation { duration: 140 } }
+                                    Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: "󰈀"; color: root.ethernetConnected ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 15 } }
+                                    Column {
+                                        anchors.left: parent.left; anchors.leftMargin: 42; anchors.verticalCenter: parent.verticalCenter; spacing: 2
+                                        Text { text: "Ethernet"; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } }
+                                        Text { text: root.ethernetConnected ? "Connected · click to disconnect" : "Disconnected · click to connect"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8 } }
+                                    }
+                                    Text { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: root.ethernetConnected ? "󰄬" : "󰅂"; color: root.ethernetConnected ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 12 } }
+                                    MouseArea { id: ethernetMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleEthernet() }
+                                }
+
+                                Flickable {
+                                    width: parent.width
+                                    height: root.listHeight(root.wifiNetworks.length, 54, 6, 5)
+                                    contentWidth: width
+                                    contentHeight: wifiNetworkColumn.implicitHeight
+                                    clip: true
+                                    boundsBehavior: Flickable.StopAtBounds
+                                    flickableDirection: Flickable.VerticalFlick
+
+                                    Behavior on height {
+                                        NumberAnimation { duration: 260; easing.type: Easing.OutQuint }
+                                    }
+
+                                    Column {
+                                        id: wifiNetworkColumn
+                                        width: parent.width
+                                        spacing: 6
+
+                                        Text {
+                                            width: parent.width; height: 54
+                                            visible: root.wifiNetworks.length === 0
+                                            verticalAlignment: Text.AlignVCenter
+                                            horizontalAlignment: Text.AlignHCenter
+                                            text: root.wifiOn ? "Scanning for networks…" : "Wi-Fi is off"
+                                            color: root.colMuted
+                                            font { family: root.fontFamily; pixelSize: 9 }
+                                        }
+
+                                        Repeater {
+                                            model: root.wifiNetworks
+                                            Rectangle {
+                                                id: wifiRow
+                                                required property var modelData
+                                                width: wifiNetworkColumn.width; height: 54; radius: 9
+                                                color: modelData.connected ? "#30FFFFFF" : (wifiChoiceMouse.containsMouse ? "#24FFFFFF" : "#10FFFFFF")
+                                                border.width: 1; border.color: modelData.connected ? "#55FFFFFF" : "#18FFFFFF"
+                                                Behavior on color { ColorAnimation { duration: 140 } }
+
+                                                // NetworkManager answers asynchronously,
+                                                // so a rejected passphrase arrives here
+                                                // rather than at the call site.
+                                                Connections {
+                                                    target: wifiRow.modelData
+                                                    function onConnectionFailed(reason) {
+                                                        root.wifiError = wifiRow.modelData.name + ": "
+                                                            + ConnectionFailReason.toString(reason);
+                                                    }
+                                                }
+
+                                                Text {
+                                                    anchors.left: parent.left; anchors.leftMargin: 12
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    text: root.signalGlyph(wifiRow.modelData)
+                                                    color: wifiRow.modelData.connected ? root.colActive : root.colMuted
+                                                    font { family: root.fontFamily; pixelSize: 15 }
+                                                }
+                                                Column {
+                                                    anchors.left: parent.left; anchors.leftMargin: 42
+                                                    anchors.right: wifiRowRight.left; anchors.rightMargin: 8
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    spacing: 2
+                                                    Text {
+                                                        width: parent.width
+                                                        text: wifiRow.modelData.name
+                                                        elide: Text.ElideRight
+                                                        color: root.colFg
+                                                        font { family: root.fontFamily; pixelSize: 10; bold: true }
+                                                    }
+                                                    Text {
+                                                        width: parent.width
+                                                        text: root.wifiStatusText(wifiRow.modelData)
+                                                        elide: Text.ElideRight
+                                                        color: root.colMuted
+                                                        font { family: root.fontFamily; pixelSize: 8 }
+                                                    }
+                                                }
+                                                Row {
+                                                    id: wifiRowRight
+                                                    anchors.right: parent.right; anchors.rightMargin: 10
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    spacing: 8
+                                                    Text {
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        visible: wifiRow.modelData.security !== WifiSecurityType.Open
+                                                        text: "󰌾"
+                                                        color: root.colMuted
+                                                        font { family: root.fontFamily; pixelSize: 10 }
+                                                    }
+                                                    Text {
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        text: root.signalPercent(wifiRow.modelData) + "%"
+                                                        color: root.colMuted
+                                                        font { family: root.fontFamily; pixelSize: 8; bold: true }
+                                                    }
+                                                    // Forget only appears for saved
+                                                    // networks, where it is the only way
+                                                    // to clear a bad stored passphrase.
+                                                    Rectangle {
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        visible: wifiRow.modelData.known
+                                                        width: 24; height: 24; radius: 7
+                                                        color: wifiForgetMouse.containsMouse ? "#30FF6B6B" : "transparent"
+                                                        Behavior on color { ColorAnimation { duration: 140 } }
+                                                        Text {
+                                                            anchors.centerIn: parent
+                                                            text: "󰆴"
+                                                            color: wifiForgetMouse.containsMouse ? root.colDanger : root.colMuted
+                                                            font { family: root.fontFamily; pixelSize: 11 }
+                                                        }
+                                                        MouseArea {
+                                                            id: wifiForgetMouse
+                                                            anchors.fill: parent
+                                                            hoverEnabled: true
+                                                            cursorShape: Qt.PointingHandCursor
+                                                            onClicked: mouse => { mouse.accepted = true; root.forgetWifi(wifiRow.modelData); }
+                                                        }
+                                                    }
+                                                }
+                                                MouseArea {
+                                                    id: wifiChoiceMouse
+                                                    anchors.fill: parent
+                                                    z: -1
+                                                    hoverEnabled: true
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: root.activateWifi(wifiRow.modelData)
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        anchors.right: parent.right
+                                        width: 3
+                                        height: parent.height * Math.min(1, parent.height / Math.max(1, parent.contentHeight))
+                                        y: parent.contentY * parent.height / Math.max(1, parent.contentHeight)
+                                        radius: 2
+                                        color: "#55FFFFFF"
+                                        visible: parent.contentHeight > parent.height
+                                    }
+                                }
+
+                                Text {
+                                    width: parent.width
+                                    visible: root.wifiError !== ""
+                                    text: "󰀦  " + root.wifiError
+                                    elide: Text.ElideRight
+                                    color: root.colDanger
+                                    font { family: root.fontFamily; pixelSize: 8; bold: true }
+                                }
+
+                                Rectangle {
+                                    width: parent.width; height: 38; radius: 9
+                                    color: wifiSettingsMouse.containsMouse ? "#24FFFFFF" : "#10FFFFFF"; border.width: 1; border.color: "#18FFFFFF"
+                                    Behavior on color { ColorAnimation { duration: 140 } }
+                                    Text { anchors.centerIn: parent; text: "󰒓  Advanced network settings"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 9; bold: true } }
+                                    MouseArea { id: wifiSettingsMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.openWifiManager() }
+                                }
+                            }
+
+                            // ── Wi-Fi passphrase ────────────────────────────
+                            Column {
+                                width: parent.width
+                                spacing: 9
+                                visible: root.subPanel === "wifiPassword"
+
+                                Text {
+                                    width: parent.width
+                                    text: "Password for "
+                                        + (root.pendingWifiNetwork ? root.pendingWifiNetwork.name : "")
+                                    elide: Text.ElideRight
+                                    color: root.colFg
+                                    font { family: root.fontFamily; pixelSize: 10; bold: true }
+                                }
+                                Rectangle {
+                                    width: parent.width; height: 38; radius: 9
+                                    color: "#18FFFFFF"; border.width: 1
+                                    border.color: wifiPasswordInput.activeFocus ? "#66FFFFFF" : "#25FFFFFF"
+                                    Behavior on border.color { ColorAnimation { duration: 180 } }
+                                    TextInput {
+                                        id: wifiPasswordInput
+                                        anchors.fill: parent; anchors.leftMargin: 11; anchors.rightMargin: 40
+                                        verticalAlignment: TextInput.AlignVCenter
+                                        echoMode: wifiPasswordReveal.showing ? TextInput.Normal : TextInput.Password
+                                        passwordCharacter: "•"
+                                        color: root.colActive
+                                        selectionColor: "#55FFFFFF"
+                                        clip: true
+                                        font { family: root.fontFamily; pixelSize: 10 }
+                                        Keys.onReturnPressed: root.submitWifiPassword()
+                                        Keys.onEnterPressed: root.submitWifiPassword()
+                                        Keys.onEscapePressed: root.subPanel = "wifi"
+                                    }
+                                    Text {
+                                        anchors.left: parent.left; anchors.leftMargin: 11; anchors.verticalCenter: parent.verticalCenter
+                                        visible: wifiPasswordInput.text === "" && !wifiPasswordInput.activeFocus
+                                        text: "Enter network password"
+                                        color: root.colMuted
+                                        font { family: root.fontFamily; pixelSize: 9 }
+                                    }
+                                    // Typing a long passphrase blind is how wrong
+                                    // passwords happen in the first place.
+                                    Rectangle {
+                                        id: wifiPasswordReveal
+                                        property bool showing: false
+                                        anchors.right: parent.right; anchors.rightMargin: 6
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 26; height: 26; radius: 7
+                                        color: wifiRevealMouse.containsMouse ? "#28FFFFFF" : "transparent"
+                                        Behavior on color { ColorAnimation { duration: 140 } }
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: wifiPasswordReveal.showing ? "󰈉" : "󰈈"
+                                            color: wifiRevealMouse.containsMouse ? root.colActive : root.colMuted
+                                            font { family: root.fontFamily; pixelSize: 12 }
+                                        }
+                                        MouseArea {
+                                            id: wifiRevealMouse
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: wifiPasswordReveal.showing = !wifiPasswordReveal.showing
+                                        }
+                                    }
+                                    MouseArea { anchors.fill: parent; z: -1; onClicked: wifiPasswordInput.forceActiveFocus() }
+                                }
+                                Text {
+                                    width: parent.width
+                                    visible: root.wifiError !== ""
+                                    text: "󰀦  " + root.wifiError
+                                    wrapMode: Text.Wrap
+                                    color: root.colDanger
+                                    font { family: root.fontFamily; pixelSize: 8; bold: true }
+                                }
+                                Row {
+                                    width: parent.width
+                                    spacing: 6
+                                    Rectangle {
+                                        width: (parent.width - 6) / 2; height: 36; radius: 9
+                                        color: wifiCancelMouse.containsMouse ? "#24FFFFFF" : "#12FFFFFF"
+                                        border.width: 1; border.color: "#25FFFFFF"
+                                        Behavior on color { ColorAnimation { duration: 140 } }
+                                        Text { anchors.centerIn: parent; text: "Cancel"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 9; bold: true } }
+                                        MouseArea { id: wifiCancelMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.subPanel = "wifi" }
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - 6) / 2; height: 36; radius: 9
+                                        opacity: wifiPasswordInput.text === "" ? 0.45 : 1
+                                        color: wifiConnectMouse.containsMouse ? "#35FFFFFF" : "#24FFFFFF"
+                                        border.width: 1; border.color: "#45FFFFFF"
+                                        Behavior on color { ColorAnimation { duration: 140 } }
+                                        Behavior on opacity { NumberAnimation { duration: 160 } }
+                                        Text { anchors.centerIn: parent; text: "Connect"; color: root.colActive; font { family: root.fontFamily; pixelSize: 9; bold: true } }
+                                        MouseArea { id: wifiConnectMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.submitWifiPassword() }
+                                    }
+                                }
+                            }
+
+                            // ── Bluetooth ───────────────────────────────────
+                            Column {
+                                width: parent.width
+                                spacing: 6
+                                visible: root.subPanel === "bluetooth"
+
+                                Rectangle {
+                                    width: parent.width; height: 48; radius: 9
+                                    color: btRadioMouse.containsMouse ? "#2CFFFFFF" : (root.btOn ? "#20FFFFFF" : "#10FFFFFF")
+                                    border.width: 1; border.color: root.btOn ? "#40FFFFFF" : "#18FFFFFF"
+                                    opacity: root.btAvailable ? 1 : 0.5
+                                    Behavior on color { ColorAnimation { duration: 140 } }
+                                    Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: root.btOn ? "󰂯" : "󰂲"; color: root.btOn ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 15 } }
+                                    Column {
+                                        anchors.left: parent.left; anchors.leftMargin: 42; anchors.verticalCenter: parent.verticalCenter; spacing: 2
+                                        Text { text: "Bluetooth"; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } }
+                                        Text {
+                                            text: !root.btAvailable
+                                                ? "No adapter found"
+                                                : (root.btOn
+                                                    ? (root.btConnectedCount > 0 ? root.btConnectedCount + " connected" : "On · no devices connected")
+                                                    : "Off")
+                                            color: root.colMuted
+                                            font { family: root.fontFamily; pixelSize: 8 }
+                                        }
+                                    }
+                                    Rectangle {
+                                        anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                                        width: 34; height: 18; radius: 9
+                                        color: root.btOn ? "#66FFFFFF" : "#28FFFFFF"
+                                        Behavior on color { ColorAnimation { duration: 180 } }
+                                        Rectangle {
+                                            y: 3; width: 12; height: 12; radius: 6
+                                            x: root.btOn ? 19 : 3
+                                            color: root.btOn ? "#1E1D1E" : root.colMuted
+                                            Behavior on x { NumberAnimation { duration: 260; easing.type: Easing.OutBack; easing.overshoot: 2.2 } }
+                                            Behavior on color { ColorAnimation { duration: 180 } }
+                                        }
+                                    }
+                                    MouseArea { id: btRadioMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; enabled: root.btAvailable; onClicked: root.toggleBluetooth() }
+                                }
+
+                                Flickable {
+                                    width: parent.width
+                                    height: root.listHeight(root.btDevices.length, 54, 6, 5)
+                                    contentWidth: width
+                                    contentHeight: btDeviceColumn.implicitHeight
+                                    clip: true
+                                    boundsBehavior: Flickable.StopAtBounds
+                                    flickableDirection: Flickable.VerticalFlick
+
+                                    Behavior on height {
+                                        NumberAnimation { duration: 260; easing.type: Easing.OutQuint }
+                                    }
+
+                                    Column {
+                                        id: btDeviceColumn
+                                        width: parent.width
+                                        spacing: 6
+
+                                        Text {
+                                            width: parent.width; height: 54
+                                            visible: root.btDevices.length === 0
+                                            verticalAlignment: Text.AlignVCenter
+                                            horizontalAlignment: Text.AlignHCenter
+                                            text: root.btOn ? "Searching for devices…" : "Bluetooth is off"
+                                            color: root.colMuted
+                                            font { family: root.fontFamily; pixelSize: 9 }
+                                        }
+
+                                        Repeater {
+                                            model: root.btDevices
+                                            Rectangle {
+                                                id: btRow
+                                                required property var modelData
+                                                width: btDeviceColumn.width; height: 54; radius: 9
+                                                color: modelData.connected ? "#30FFFFFF" : (btChoiceMouse.containsMouse ? "#24FFFFFF" : "#10FFFFFF")
+                                                border.width: 1; border.color: modelData.connected ? "#55FFFFFF" : "#18FFFFFF"
+                                                Behavior on color { ColorAnimation { duration: 140 } }
+
+                                                Text {
+                                                    anchors.left: parent.left; anchors.leftMargin: 12
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    text: root.btGlyph(btRow.modelData)
+                                                    color: btRow.modelData.connected ? root.colActive : root.colMuted
+                                                    font { family: root.fontFamily; pixelSize: 15 }
+                                                    // A slow spin while the stack is
+                                                    // mid-handshake; BlueZ pairing can
+                                                    // take several seconds.
+                                                    RotationAnimation on rotation {
+                                                        running: btRow.modelData.pairing
+                                                        from: 0; to: 360; duration: 1400
+                                                        loops: Animation.Infinite
+                                                        alwaysRunToEnd: true
+                                                    }
+                                                }
+                                                Column {
+                                                    anchors.left: parent.left; anchors.leftMargin: 42
+                                                    anchors.right: btRowRight.left; anchors.rightMargin: 8
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    spacing: 2
+                                                    Text {
+                                                        width: parent.width
+                                                        text: btRow.modelData.name
+                                                        elide: Text.ElideRight
+                                                        color: root.colFg
+                                                        font { family: root.fontFamily; pixelSize: 10; bold: true }
+                                                    }
+                                                    Text {
+                                                        width: parent.width
+                                                        text: root.btStatusText(btRow.modelData)
+                                                        elide: Text.ElideRight
+                                                        color: root.colMuted
+                                                        font { family: root.fontFamily; pixelSize: 8 }
+                                                    }
+                                                }
+                                                Row {
+                                                    id: btRowRight
+                                                    anchors.right: parent.right; anchors.rightMargin: 10
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    spacing: 6
+                                                    Text {
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        text: btRow.modelData.connected ? "󰄬" : "󰅂"
+                                                        color: btRow.modelData.connected ? root.colActive : root.colMuted
+                                                        font { family: root.fontFamily; pixelSize: 12 }
+                                                    }
+                                                    Rectangle {
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        visible: btRow.modelData.paired || btRow.modelData.bonded
+                                                        width: 24; height: 24; radius: 7
+                                                        color: btForgetMouse.containsMouse ? "#30FF6B6B" : "transparent"
+                                                        Behavior on color { ColorAnimation { duration: 140 } }
+                                                        Text {
+                                                            anchors.centerIn: parent
+                                                            text: "󰆴"
+                                                            color: btForgetMouse.containsMouse ? root.colDanger : root.colMuted
+                                                            font { family: root.fontFamily; pixelSize: 11 }
+                                                        }
+                                                        MouseArea {
+                                                            id: btForgetMouse
+                                                            anchors.fill: parent
+                                                            hoverEnabled: true
+                                                            cursorShape: Qt.PointingHandCursor
+                                                            onClicked: mouse => { mouse.accepted = true; root.btForget(btRow.modelData); }
+                                                        }
+                                                    }
+                                                }
+                                                MouseArea {
+                                                    id: btChoiceMouse
+                                                    anchors.fill: parent
+                                                    z: -1
+                                                    hoverEnabled: true
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: root.btDeviceAction(btRow.modelData)
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        anchors.right: parent.right
+                                        width: 3
+                                        height: parent.height * Math.min(1, parent.height / Math.max(1, parent.contentHeight))
+                                        y: parent.contentY * parent.height / Math.max(1, parent.contentHeight)
+                                        radius: 2
+                                        color: "#55FFFFFF"
+                                        visible: parent.contentHeight > parent.height
+                                    }
+                                }
+
+                                Text {
+                                    width: parent.width
+                                    visible: root.btError !== ""
+                                    text: "󰀦  " + root.btError
+                                    elide: Text.ElideRight
+                                    color: root.colDanger
+                                    font { family: root.fontFamily; pixelSize: 8; bold: true }
+                                }
+
+                                Text {
+                                    width: parent.width
+                                    visible: root.btOn
+                                    horizontalAlignment: Text.AlignHCenter
+                                    text: "Put a device in pairing mode for it to appear here"
+                                    color: root.colMuted
+                                    font { family: root.fontFamily; pixelSize: 8 }
+                                }
                             }
                         }
                     }
@@ -631,20 +1235,6 @@ Scope {
             }
 
             Process {
-                id: wifiListProc
-                command: [root.scriptPath("wifi-list.sh")]
-                stdout: SplitParser {
-                    onRead: data => {
-                        let rows = data.trim() ? data.trim().split("\x1e") : [];
-                        root.wifiNetworks = rows.map(row => {
-                            let values = row.split("\x1f");
-                            return { ssid: values[0] || "Unknown", signal: parseInt(values[1]) || 0, security: values[2] || "Open", active: values[3] === "yes", savedId: values[4] || "" };
-                        });
-                    }
-                }
-            }
-
-            Process {
                 id: gpuPollProc
                 command: ["sh", "-c", "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0"]
                 running: true
@@ -658,59 +1248,32 @@ Scope {
                 stdout: SplitParser { onRead: data => root.batteryPercent = parseInt(data.trim()) }
             }
 
-            Process {
-                id: wifiPollProc
-                command: ["sh", "-c", "nmcli radio wifi 2>/dev/null || echo disabled"]
-                running: true
-                stdout: SplitParser { onRead: data => root.wifiEnabled = data.trim() === "enabled" }
-            }
-
-            Process {
-                id: bluetoothPollProc
-                command: ["sh", "-c", "if rfkill list bluetooth >/dev/null 2>&1; then rfkill list bluetooth | awk '/Soft blocked:/ {print \"yes|||\" $3; exit}'; else echo 'no|||yes'; fi"]
-                running: true
-                stdout: SplitParser {
-                    onRead: data => {
-                        let values = data.trim().split("|||");
-                        root.bluetoothAvailable = values[0] === "yes";
-                        root.bluetoothBlocked = values[1] === "yes";
-                    }
-                }
-            }
-
             Timer { interval: 1500; running: true; repeat: true; onTriggered: { mediaPollProc.running = true; mediaPositionProc.running = root.mediaService !== ""; mediaLengthProc.running = root.mediaService !== ""; recordingPollProc.running = true; micPollProc.running = true; } }
-            Timer { interval: 5000; running: true; repeat: true; onTriggered: { gpuPollProc.running = true; batteryPollProc.running = true; wifiPollProc.running = true; wifiListProc.running = true; mediaListProc.running = true; bluetoothPollProc.running = true; } }
+            Timer { interval: 5000; running: true; repeat: true; onTriggered: { gpuPollProc.running = true; batteryPollProc.running = true; mediaListProc.running = true; } }
             Timer { interval: 1000; running: root.isRecording; repeat: true; onTriggered: root.recordSeconds++ }
-            Timer { id: wifiListRefresh; interval: 1200; repeat: false; onTriggered: wifiListProc.running = true }
-            Timer { id: ethernetPollDelay; interval: 900; repeat: false; onTriggered: netPollProc.running = true }
             Timer { id: recordRefreshTimer; interval: 500; repeat: false; onTriggered: recordingPollProc.running = true }
             Timer { id: mediaPositionRefresh; interval: 500; repeat: false; onTriggered: mediaPositionProc.running = true }
 
-            Process {
-                id: netPollProc
-                command: ["sh", "-c", "devices=$(nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null); eth=$(printf '%s\\n' \"$devices\" | awk -F: '$2 == \"ethernet\" {available=1; if (iface == \"\") iface=$1; if ($3 == \"connected\") connected=1} END {printf \"%s|||%s|||%s\", available ? \"yes\" : \"no\", connected ? \"yes\" : \"no\", iface}'); if printf '%s' \"$eth\" | grep -q '^yes|||yes|||'; then printf '󰈀 Ethernet|||%s\\n' \"$eth\"; elif printf '%s\\n' \"$devices\" | awk -F: '$2 == \"wifi\" && $3 == \"connected\" {found=1} END {exit !found}'; then printf '󰤨 WiFi|||%s\\n' \"$eth\"; else printf '󰤭 Disconnected|||%s\\n' \"$eth\"; fi"]
-                running: true
-                stdout: SplitParser {
-                    onRead: data => {
-                        let s = data.trim();
-                        if (s) {
-                            let sections = s.split("|||");
-                            let status = (sections[0] || "󰤭 Disconnected").split(" ");
-                            root.netIcon = status[0];
-                            root.netType = status[1] || "Disconnected";
-                            root.ethernetAvailable = sections[1] === "yes";
-                            root.ethernetConnected = sections[2] === "yes";
-                            root.ethernetDevice = sections[3] || "";
-                        }
-                    }
-                }
+            // Scanning is expensive and NetworkManager rate-limits it, so the
+            // Wi-Fi scanner only runs while its panel is actually on screen —
+            // which is also what keeps the list fresh, the thing the old
+            // `--rescan no` pipeline never did.
+            Binding {
+                target: root.wifiDevice
+                property: "scannerEnabled"
+                value: root.commandCenterOpen
+                    && (root.subPanel === "wifi" || root.subPanel === "wifiPassword")
+                when: root.wifiDevice !== null
+                restoreMode: Binding.RestoreBindingOrValue
             }
 
-            Timer {
-                interval: 3000
-                running: true
-                repeat: true
-                onTriggered: netPollProc.running = true
+            // Likewise discovery: leaving it on drains batteries on both ends.
+            Binding {
+                target: root.btAdapter
+                property: "discovering"
+                value: root.commandCenterOpen && root.subPanel === "bluetooth"
+                when: root.btAdapter !== null && root.btOn
+                restoreMode: Binding.RestoreBindingOrValue
             }
 
             // System Metrics (CPU, RAM, Temp, Uptime)
@@ -763,6 +1326,83 @@ Scope {
             property bool commandCenterOpen: false
             property bool powerOpen: false
 
+            // Animation drivers.
+            //
+            // Each popup is driven by a single 0..1 progress value instead of a
+            // Behavior per property, so its geometry can never desync halfway
+            // through a morph. `*Progress` carries the springy curve and is
+            // allowed to overshoot past 1; `*Content` is a plain linear ramp
+            // used only to stagger the reveal of the rows inside, because the
+            // springy curve is far too front-loaded to stagger against (it is
+            // already at 65% after a fifth of its duration).
+            property real ccProgress: 0
+            property real ccContent: 0
+            property real powerProgress: 0
+            property real powerContent: 0
+
+            function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+            function outCubic(v) { let t = root.clamp01(v); return 1 - Math.pow(1 - t, 3); }
+
+            // Row `order` starts moving a beat after the row before it. The
+            // leading offset holds the whole cascade back until the card has
+            // actually reached full width — OutBack crosses 1.0 at 43% of its
+            // duration — so no row is ever revealed while the clip rectangle is
+            // still narrow enough to cut it off at the sides.
+            function ccReveal(order) { return root.outCubic((root.ccContent - 0.34 - order * 0.05) / 0.33); }
+            function powerReveal(order) { return root.outCubic((root.powerContent - 0.34 - order * 0.075) / 0.4); }
+
+            // Restarting from the changed handler (rather than binding the
+            // progress and leaning on a Behavior) guarantees `to`, `duration`
+            // and `easing` are re-read after the open flag has already flipped.
+            onCommandCenterOpenChanged: ccAnim.restart()
+            onPowerOpenChanged: powerAnim.restart()
+
+            ParallelAnimation {
+                id: ccAnim
+                NumberAnimation {
+                    target: root
+                    property: "ccProgress"
+                    to: root.commandCenterOpen ? 1 : 0
+                    duration: root.commandCenterOpen ? 470 : 250
+                    easing.type: root.commandCenterOpen ? Easing.OutBack : Easing.InCubic
+                    easing.overshoot: 1.35
+                }
+                NumberAnimation {
+                    target: root
+                    property: "ccContent"
+                    to: root.commandCenterOpen ? 1 : 0
+                    duration: root.commandCenterOpen ? 560 : 140
+                    easing.type: Easing.Linear
+                }
+            }
+
+            ParallelAnimation {
+                id: powerAnim
+                NumberAnimation {
+                    target: root
+                    property: "powerProgress"
+                    to: root.powerOpen ? 1 : 0
+                    duration: root.powerOpen ? 430 : 220
+                    easing.type: root.powerOpen ? Easing.OutBack : Easing.InCubic
+                    easing.overshoot: 1.8
+                }
+                NumberAnimation {
+                    target: root
+                    property: "powerContent"
+                    to: root.powerOpen ? 1 : 0
+                    duration: root.powerOpen ? 480 : 130
+                    easing.type: Easing.Linear
+                }
+            }
+
+            // Cross-fade between the Command Centre body and a sub-panel
+            // (media picker / Wi-Fi list) without either one being clickable
+            // while it is faded out.
+            property real selProgress: root.subPanelOpen ? 1 : 0
+            Behavior on selProgress {
+                NumberAnimation { duration: 230; easing.type: Easing.OutCubic }
+            }
+
             // Input Mask
             mask: Region {
                 Region { item: (root.commandCenterOpen || root.powerOpen) ? dismissOverlay : null }
@@ -782,9 +1422,7 @@ Scope {
                 onClicked: {
                     root.commandCenterOpen = false;
                     root.powerOpen = false;
-                    root.mediaSelectorOpen = false;
-                    root.wifiSelectorOpen = false;
-                    root.wifiPasswordOpen = false;
+                    root.subPanel = "";
                 }
             }
 
@@ -824,7 +1462,7 @@ Scope {
                                 Rectangle {
                                     id: pill
                                     anchors.verticalCenter: parent.verticalCenter
-                                    height: 8
+                                    height: wsItem.isActive ? 9 : 8
                                     radius: height / 2
                                     width: wsItem.isActive ? 28 : (wsItem.isOccupied ? 12 : 8)
 
@@ -834,10 +1472,39 @@ Scope {
                                             ? "#FFFFFF"
                                             : (wsItem.isOccupied ? root.colOccupied : root.colInactive))
 
+                                    // Hover scale has to be state-dependent. A flat
+                                    // multiplier reads fine on an 8px dot but
+                                    // compounds with the active pill's own 28px
+                                    // width, so clicking a workspace with the mouse
+                                    // left you hovering a pill that had ballooned in
+                                    // both directions at once.
+                                    scale: mouseArea.pressed
+                                        ? 0.82
+                                        : (wsItem.isHovered ? (wsItem.isActive ? 1.06 : 1.25) : 1)
+
+                                    // The pill's own width drives `wsItem.width`, so
+                                    // overshooting here rubber-bands the whole row.
                                     Behavior on width {
                                         NumberAnimation {
-                                            duration: 250
-                                            easing.type: Easing.OutCubic
+                                            duration: 420
+                                            easing.type: Easing.OutBack
+                                            easing.overshoot: 2.0
+                                        }
+                                    }
+
+                                    Behavior on height {
+                                        NumberAnimation {
+                                            duration: 320
+                                            easing.type: Easing.OutBack
+                                            easing.overshoot: 2.4
+                                        }
+                                    }
+
+                                    Behavior on scale {
+                                        NumberAnimation {
+                                            duration: 280
+                                            easing.type: Easing.OutBack
+                                            easing.overshoot: 2.4
                                         }
                                     }
 
@@ -875,6 +1542,19 @@ Scope {
                     radius: root.panelRadius
                     border.width: 1
                     border.color: (timeMouse.containsMouse || root.commandCenterOpen) ? "#555555" : root.colBorder
+
+                    // Physical press feedback. The Command Centre grows from this
+                    // island's `width`/`height`, which `scale` does not touch, so
+                    // the two never fight over the morph's starting geometry.
+                    scale: timeMouse.pressed ? 0.955 : 1
+
+                    Behavior on scale {
+                        NumberAnimation { duration: 260; easing.type: Easing.OutBack; easing.overshoot: 2.6 }
+                    }
+
+                    Behavior on width {
+                        NumberAnimation { duration: 300; easing.type: Easing.OutQuint }
+                    }
 
                     Behavior on border.color {
                         ColorAnimation { duration: 150 }
@@ -921,9 +1601,7 @@ Scope {
                         onClicked: {
                             root.commandCenterOpen = !root.commandCenterOpen;
                             if (!root.commandCenterOpen) {
-                                root.mediaSelectorOpen = false;
-                                root.wifiSelectorOpen = false;
-                                root.wifiPasswordOpen = false;
+                                root.subPanel = "";
                             }
                             root.powerOpen = false;
                         }
@@ -955,6 +1633,14 @@ Scope {
                             color: volMouse.containsMouse ? "#FFFFFF" : (root.isMuted ? root.colMuted : root.colFg)
                             font { family: root.fontFamily; pixelSize: root.fontSize + 2 }
                             anchors.verticalCenter: parent.verticalCenter
+                            scale: volMouse.pressed ? 0.84 : (volMouse.containsMouse ? 1.18 : 1)
+
+                            Behavior on scale {
+                                NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.8 }
+                            }
+                            Behavior on color {
+                                ColorAnimation { duration: 150 }
+                            }
 
                             MouseArea {
                                 id: volMouse
@@ -987,6 +1673,14 @@ Scope {
                             color: kbMouse.containsMouse ? "#FFFFFF" : root.colFg
                             font { family: root.fontFamily; pixelSize: root.fontSize; bold: true }
                             anchors.verticalCenter: parent.verticalCenter
+                            scale: kbMouse.pressed ? 0.84 : (kbMouse.containsMouse ? 1.18 : 1)
+
+                            Behavior on scale {
+                                NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.8 }
+                            }
+                            Behavior on color {
+                                ColorAnimation { duration: 150 }
+                            }
 
                             MouseArea {
                                 id: kbMouse
@@ -1012,6 +1706,14 @@ Scope {
                             color: netMouse.containsMouse ? "#FFFFFF" : root.colFg
                             font { family: root.fontFamily; pixelSize: root.fontSize + 2 }
                             anchors.verticalCenter: parent.verticalCenter
+                            scale: netMouse.pressed ? 0.84 : (netMouse.containsMouse ? 1.18 : 1)
+
+                            Behavior on scale {
+                                NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.8 }
+                            }
+                            Behavior on color {
+                                ColorAnimation { duration: 150 }
+                            }
 
                             MouseArea {
                                 id: netMouse
@@ -1020,7 +1722,11 @@ Scope {
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
+                                    // Straight to the network list rather than the
+                                    // Command Centre's front page — it is the only
+                                    // reason to click a network icon.
                                     root.commandCenterOpen = true;
+                                    root.subPanel = "wifi";
                                     root.powerOpen = false;
                                 }
                             }
@@ -1040,6 +1746,16 @@ Scope {
                             color: (powerMouse.containsMouse || root.powerOpen) ? "#c74028" : root.colFg
                             font { family: root.fontFamily; pixelSize: root.fontSize + 2 }
                             anchors.verticalCenter: parent.verticalCenter
+                            scale: powerMouse.pressed ? 0.84 : (powerMouse.containsMouse ? 1.18 : 1)
+                            rotation: root.powerOpen ? 180 : 0
+
+                            Behavior on scale {
+                                NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.8 }
+                            }
+
+                            Behavior on rotation {
+                                NumberAnimation { duration: 420; easing.type: Easing.OutBack; easing.overshoot: 2.2 }
+                            }
 
                             Behavior on color {
                                 ColorAnimation { duration: 150 }
@@ -1060,47 +1776,87 @@ Scope {
                     }
                 }
 
+                // Soft lift under the Command Centre. Drawn as a sibling rather
+                // than a layer effect so the blur is free to bleed outside the
+                // card's own bounds.
+                RectangularShadow {
+                    z: 4
+                    anchors.fill: commandCenterCard
+                    radius: commandCenterCard.radius
+                    blur: 40
+                    spread: 3
+                    offset.y: 12
+                    color: "#96000000"
+                    opacity: commandCenterCard.pc
+                    visible: commandCenterCard.visible
+                }
+
                 // Command Centre — monochrome glass, matching Hyprland itself.
+                //
+                // It grows out of the clock island rather than fading in on top
+                // of it: at progress 0 the card has exactly the island's size,
+                // position and corner radius, so it is completely hidden behind
+                // it (the island is opaque and painted at a higher z). Every
+                // frame after that is the same rectangle stretching downward.
                 Rectangle {
                     id: commandCenterCard
                     z: 6
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    y: root.commandCenterOpen ? 46 : 28
-                    width: 410
-                    height: (root.mediaSelectorOpen || root.wifiSelectorOpen)
-                        ? selectorOverlay.height + 20
+
+                    readonly property real openWidth: 410
+                    // The natural open height, kept on its own timeline so that
+                    // opening a sub-panel resizes the card without fighting the
+                    // open/close morph for control of `height`.
+                    property real openHeight: root.subPanelOpen
+                        ? selectorOverlay.naturalHeight + 20
                         : 524
+                    Behavior on openHeight {
+                        NumberAnimation { duration: 340; easing.type: Easing.OutQuint }
+                    }
+
+                    readonly property real p: root.ccProgress
+                    readonly property real pc: root.clamp01(root.ccProgress)
+
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    y: 46 * Math.max(0, p)
+                    width: timeIsland.width + (openWidth - timeIsland.width) * p
+                    height: Math.max(0, timeIsland.height + (openHeight - timeIsland.height) * p)
+                    radius: root.panelRadius + 4 * pc
                     color: "#E61E1D1E"
-                    radius: 10
                     border.width: 1
                     border.color: "#55FFFFFF"
-                    opacity: root.commandCenterOpen ? 1 : 0
-                    scale: root.commandCenterOpen ? 1 : 0.87
-                    visible: opacity > 0.01
-                    transformOrigin: Item.Top
-
-                    Behavior on y { NumberAnimation { duration: 220; easing.type: Easing.OutQuint } }
-                    Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
-                    Behavior on scale { NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 1.08 } }
+                    visible: p > 0.001
+                    clip: true
 
                     Rectangle {
                         anchors.fill: parent
                         anchors.margins: 1
-                        radius: 9
+                        radius: commandCenterCard.radius - 1
                         color: "transparent"
                         border.width: 1
                         border.color: "#12FFFFFF"
                     }
 
                     Column {
-                        anchors.fill: parent
-                        anchors.margins: 12
+                        // Laid out at the card's final width so the rows do not
+                        // reflow while the card is still growing, and centred
+                        // rather than pinned to the left inset: the card is
+                        // itself centred, so this keeps the content at a fixed
+                        // position on screen instead of dragging sideways as the
+                        // card's left edge sweeps outwards.
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        y: 12
+                        width: commandCenterCard.openWidth - 24
                         spacing: 8
-                        visible: !root.mediaSelectorOpen && !root.wifiSelectorOpen
+                        opacity: 1 - root.selProgress
+                        scale: 1 - 0.05 * root.selProgress
+                        transformOrigin: Item.Top
+                        visible: opacity > 0.01
 
                         Item {
                             width: parent.width
                             height: 42
+                            opacity: root.ccReveal(0)
+                            transform: Translate { y: (1 - root.ccReveal(0)) * 26 }
 
                             Column {
                                 anchors.left: parent.left
@@ -1129,6 +1885,8 @@ Scope {
                             width: parent.width
                             height: 118; radius: 10; color: "#B3262526"; border.width: 1; border.color: "#18FFFFFF"
                             clip: true
+                            opacity: root.ccReveal(1)
+                            transform: Translate { y: (1 - root.ccReveal(1)) * 26 }
 
                             Item {
                                 z: 0
@@ -1172,13 +1930,13 @@ Scope {
                                 text: (root.mediaAvailable ? root.mediaPlayerName.toUpperCase() : "MEDIA") + "  󰅀"
                                 color: mediaSourceMouse.containsMouse ? root.colActive : root.colMuted
                                 font { family: root.fontFamily; pixelSize: 8; bold: true; letterSpacing: 1.1 }
-                                MouseArea { id: mediaSourceMouse; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { root.mediaSelectorOpen = !root.mediaSelectorOpen; root.wifiSelectorOpen = false; root.wifiPasswordOpen = false; mediaListProc.running = true; } }
+                                MouseArea { id: mediaSourceMouse; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { root.subPanel = root.subPanel === "media" ? "" : "media"; mediaListProc.running = true; } }
                             }
                             Text { z: 2; anchors.left: parent.left; anchors.leftMargin: 13; anchors.right: mediaControls.left; anchors.rightMargin: 10; anchors.top: parent.top; anchors.topMargin: 31; text: root.mediaTitle; elide: Text.ElideRight; color: root.colActive; font { family: root.fontFamily; pixelSize: 12; bold: true } }
                             Text { z: 2; anchors.left: parent.left; anchors.leftMargin: 13; anchors.right: mediaControls.left; anchors.rightMargin: 10; anchors.top: parent.top; anchors.topMargin: 51; text: root.mediaArtist; elide: Text.ElideRight; color: root.colFg; font { family: root.fontFamily; pixelSize: 9 } }
                             Row {
                                 id: mediaControls; z: 2; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 5
-                                Repeater { model: [{ icon: "󰒮", action: "previous" }, { icon: root.mediaStatus === "Playing" ? "󰏤" : "󰐊", action: "play-pause" }, { icon: "󰒭", action: "next" }]; Rectangle { required property var modelData; width: modelData.action === "play-pause" ? 38 : 30; height: 34; radius: 9; color: mediaButton.containsMouse ? "#30FFFFFF" : "#12FFFFFF"; Text { anchors.centerIn: parent; text: modelData.icon; color: root.colFg; font { family: root.fontFamily; pixelSize: modelData.action === "play-pause" ? 17 : 13 } } MouseArea { id: mediaButton; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.mediaAction(modelData.action) } } }
+                                Repeater { model: [{ icon: "󰒮", action: "previous" }, { icon: root.mediaStatus === "Playing" ? "󰏤" : "󰐊", action: "play-pause" }, { icon: "󰒭", action: "next" }]; Rectangle { required property var modelData; width: modelData.action === "play-pause" ? 38 : 30; height: 34; radius: 9; color: mediaButton.containsMouse ? "#30FFFFFF" : "#12FFFFFF"; scale: mediaButton.pressed ? 0.86 : (mediaButton.containsMouse ? 1.13 : 1); Behavior on scale { NumberAnimation { duration: 220; easing.type: Easing.OutBack; easing.overshoot: 3.2 } } Behavior on color { ColorAnimation { duration: 140 } } Text { anchors.centerIn: parent; text: modelData.icon; color: root.colFg; font { family: root.fontFamily; pixelSize: modelData.action === "play-pause" ? 17 : 13 } } MouseArea { id: mediaButton; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.mediaAction(modelData.action) } } }
                             }
                             Rectangle {
                                 id: mediaProgressTrack
@@ -1209,16 +1967,20 @@ Scope {
 
                         Grid {
                             width: parent.width; height: 114; columns: 2; spacing: 6
+                            opacity: root.ccReveal(2)
+                            transform: Translate { y: (1 - root.ccReveal(2)) * 26 }
                             Repeater { model: [
-                                { icon: root.wifiEnabled ? root.netIcon : "󰤭", title: "Wi-Fi", value: root.wifiEnabled ? root.netType : "Disabled", type: "wifi", active: root.wifiEnabled },
+                                { icon: root.wifiOn ? root.netIcon : "󰤭", title: "Wi-Fi", value: root.wifiOn ? root.netType : "Off", type: "wifi", active: root.wifiOn },
                                 { icon: root.micMuted ? "󰍭" : "󰍬", title: "Microphone", value: root.micMuted ? "Muted" : root.micPercent + "%", type: "mic", active: !root.micMuted },
-                                { icon: "󰂯", title: "Bluetooth", value: !root.bluetoothAvailable ? "Unavailable" : (root.bluetoothBlocked ? "Disabled" : "Enabled"), type: "bluetooth", active: root.bluetoothAvailable && !root.bluetoothBlocked },
+                                { icon: root.btOn ? "󰂯" : "󰂲", title: "Bluetooth", value: !root.btAvailable ? "No adapter" : (root.btOn ? (root.btConnectedCount > 0 ? root.btConnectedCount + " connected" : "On") : "Off"), type: "bluetooth", active: root.btOn },
                                 { icon: "󰌌", title: "Layout", value: root.kbLayout, type: "lang", active: true }
-                            ]; Rectangle { required property var modelData; width: (parent.width - 6) / 2; height: 54; radius: 10; color: toggleMouse.containsMouse ? "#30FFFFFF" : (modelData.active ? "#20FFFFFF" : "#10FFFFFF"); border.width: 1; border.color: modelData.active ? "#30FFFFFF" : "#18FFFFFF"; Text { anchors.left: parent.left; anchors.leftMargin: 11; anchors.verticalCenter: parent.verticalCenter; text: modelData.icon; color: modelData.active ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 16 } } Column { anchors.left: parent.left; anchors.leftMargin: 42; anchors.verticalCenter: parent.verticalCenter; spacing: 2; Text { text: modelData.title; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } } Text { text: modelData.value; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8 } } } MouseArea { id: toggleMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (modelData.type === "lang") root.switchLayout(); else if (modelData.type === "mic") root.toggleMic(); else if (modelData.type === "wifi") { root.wifiSelectorOpen = !root.wifiSelectorOpen; root.mediaSelectorOpen = false; wifiListProc.running = true; } else root.toggleBluetooth(); } } } }
+                            ]; Rectangle { required property var modelData; width: (parent.width - 6) / 2; height: 54; radius: 10; color: toggleMouse.containsMouse ? "#30FFFFFF" : (modelData.active ? "#20FFFFFF" : "#10FFFFFF"); border.width: 1; border.color: modelData.active ? "#30FFFFFF" : "#18FFFFFF"; scale: toggleMouse.pressed ? 0.94 : (toggleMouse.containsMouse ? 1.035 : 1); Behavior on scale { NumberAnimation { duration: 230; easing.type: Easing.OutBack; easing.overshoot: 2.8 } } Behavior on color { ColorAnimation { duration: 150 } } Text { anchors.left: parent.left; anchors.leftMargin: 11; anchors.verticalCenter: parent.verticalCenter; text: modelData.icon; color: modelData.active ? root.colActive : root.colMuted; font { family: root.fontFamily; pixelSize: 16 } } Column { anchors.left: parent.left; anchors.leftMargin: 42; anchors.verticalCenter: parent.verticalCenter; spacing: 2; Text { text: modelData.title; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } } Text { text: modelData.value; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8 } } } MouseArea { id: toggleMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (modelData.type === "lang") root.switchLayout(); else if (modelData.type === "mic") root.toggleMic(); else if (modelData.type === "wifi") root.subPanel = root.subPanel === "wifi" ? "" : "wifi"; else root.subPanel = root.subPanel === "bluetooth" ? "" : "bluetooth"; } } } }
                         }
 
                         Rectangle {
                             width: parent.width; height: 48; radius: 10; color: "#18FFFFFF"; border.width: 1; border.color: "#20FFFFFF"
+                            opacity: root.ccReveal(3)
+                            transform: Translate { y: (1 - root.ccReveal(3)) * 26 }
                             Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: root.volIcon; color: root.isMuted ? root.colMuted : root.colActive; font { family: root.fontFamily; pixelSize: 15 } }
                             Rectangle { id: monoVolumeTrack; anchors.left: parent.left; anchors.leftMargin: 42; anchors.right: parent.right; anchors.rightMargin: 52; anchors.verticalCenter: parent.verticalCenter; height: 6; radius: 3; color: "#30FFFFFF"; Rectangle { height: parent.height; radius: 3; width: parent.width * root.volPercent / 100; color: root.isMuted ? root.colMuted : root.colActive; Behavior on width { NumberAnimation { duration: 80 } } } }
                             Text { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: root.volPercent + "%"; color: root.colMuted; font { family: root.fontFamily; pixelSize: 9; bold: true } }
@@ -1227,11 +1989,15 @@ Scope {
 
                         Row {
                             width: parent.width; height: 44; spacing: 5
-                            Repeater { model: [{ label: "CPU", value: root.cpuPercent + "%" }, { label: "RAM", value: root.ramPercent + "%" }, { label: "GPU", value: root.gpuPercent + "%" }, { label: root.batteryPercent >= 0 ? "BAT" : "TEMP", value: root.batteryPercent >= 0 ? root.batteryPercent + "%" : root.cpuTemp + "°C" }]; Rectangle { required property var modelData; width: (parent.width - 15) / 4; height: parent.height; radius: 10; color: metricMouse.containsMouse ? "#25FFFFFF" : "#12FFFFFF"; border.width: 1; border.color: "#18FFFFFF"; Column { anchors.centerIn: parent; spacing: 3; Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.value; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } } Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.label; color: root.colMuted; font { family: root.fontFamily; pixelSize: 7; bold: true } } } MouseArea { id: metricMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.openBtop() } } }
+                            opacity: root.ccReveal(4)
+                            transform: Translate { y: (1 - root.ccReveal(4)) * 26 }
+                            Repeater { model: [{ label: "CPU", value: root.cpuPercent + "%" }, { label: "RAM", value: root.ramPercent + "%" }, { label: "GPU", value: root.gpuPercent + "%" }, { label: root.batteryPercent >= 0 ? "BAT" : "TEMP", value: root.batteryPercent >= 0 ? root.batteryPercent + "%" : root.cpuTemp + "°C" }]; Rectangle { required property var modelData; width: (parent.width - 15) / 4; height: parent.height; radius: 10; color: metricMouse.containsMouse ? "#25FFFFFF" : "#12FFFFFF"; border.width: 1; border.color: "#18FFFFFF"; scale: metricMouse.pressed ? 0.92 : (metricMouse.containsMouse ? 1.05 : 1); Behavior on scale { NumberAnimation { duration: 230; easing.type: Easing.OutBack; easing.overshoot: 2.8 } } Behavior on color { ColorAnimation { duration: 150 } } Column { anchors.centerIn: parent; spacing: 3; Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.value; color: root.colFg; font { family: root.fontFamily; pixelSize: 10; bold: true } } Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.label; color: root.colMuted; font { family: root.fontFamily; pixelSize: 7; bold: true } } } MouseArea { id: metricMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.openBtop() } } }
                         }
 
                         Row {
                             width: parent.width; height: 32; spacing: 5
+                            opacity: root.ccReveal(5)
+                            transform: Translate { y: (1 - root.ccReveal(5)) * 26 }
                             Rectangle {
                                 width: (parent.width - 10) / 3; height: parent.height; radius: 8
                                 color: root.recordMode === "screen" ? "#32FFFFFF" : "#12FFFFFF"; border.width: 1; border.color: "#20FFFFFF"
@@ -1254,56 +2020,58 @@ Scope {
 
                         Row {
                             width: parent.width; height: 54; spacing: 5
+                            opacity: root.ccReveal(6)
+                            transform: Translate { y: (1 - root.ccReveal(6)) * 26 }
 
-                            Repeater { model: [{ label: "Snip", icon: "󰄀", command: "snip" }, { label: root.isRecording ? root.formatMediaTime(root.recordSeconds) : "Record", icon: root.isRecording ? "󰻃" : "󰑊", command: "record" }, { label: root.isMuted ? "Unmute" : "Mute", icon: root.volIcon, command: "mute" }, { label: "Lock", icon: "󰌾", command: "lock" }]; Rectangle { required property var modelData; width: (parent.width - 15) / 4; height: parent.height; radius: 10; color: modelData.command === "record" && root.isRecording ? "#38C74028" : (quickActionMouse.containsMouse ? "#30FFFFFF" : "#18FFFFFF"); border.width: 1; border.color: modelData.command === "record" && root.isRecording ? "#88C74028" : "#20FFFFFF"; Column { anchors.centerIn: parent; spacing: 3; Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.icon; color: modelData.command === "record" && root.isRecording ? "#FF8A78" : root.colFg; font { family: root.fontFamily; pixelSize: 14 } } Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.label; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8; bold: true } } } MouseArea { id: quickActionMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (modelData.command === "record") root.toggleRecording(); else if (modelData.command === "mute") root.toggleMute(); else if (modelData.command === "lock") { root.commandCenterOpen = false; Quickshell.execDetached(["hyprlock"]); } else { root.commandCenterOpen = false; Quickshell.execDetached(["sh", "-c", "mkdir -p ~/Pictures/Screenshots && file=~/Pictures/Screenshots/screenshot_$(date +%Y%m%d_%H%M%S).png; grim -g \"$(slurp)\" \"$file\" && wl-copy < \"$file\""]); } } } } }
+                            Repeater { model: [{ label: "Snip", icon: "󰄀", command: "snip" }, { label: root.isRecording ? root.formatMediaTime(root.recordSeconds) : "Record", icon: root.isRecording ? "󰻃" : "󰑊", command: "record" }, { label: root.isMuted ? "Unmute" : "Mute", icon: root.volIcon, command: "mute" }, { label: "Lock", icon: "󰌾", command: "lock" }]; Rectangle { required property var modelData; width: (parent.width - 15) / 4; height: parent.height; radius: 10; color: modelData.command === "record" && root.isRecording ? "#38C74028" : (quickActionMouse.containsMouse ? "#30FFFFFF" : "#18FFFFFF"); border.width: 1; border.color: modelData.command === "record" && root.isRecording ? "#88C74028" : "#20FFFFFF"; scale: quickActionMouse.pressed ? 0.92 : (quickActionMouse.containsMouse ? 1.05 : 1); Behavior on scale { NumberAnimation { duration: 230; easing.type: Easing.OutBack; easing.overshoot: 2.8 } } Behavior on color { ColorAnimation { duration: 150 } } Column { anchors.centerIn: parent; spacing: 3; Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.icon; color: modelData.command === "record" && root.isRecording ? "#FF8A78" : root.colFg; font { family: root.fontFamily; pixelSize: 14 } } Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.label; color: root.colMuted; font { family: root.fontFamily; pixelSize: 8; bold: true } } } MouseArea { id: quickActionMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (modelData.command === "record") root.toggleRecording(); else if (modelData.command === "mute") root.toggleMute(); else if (modelData.command === "lock") { root.commandCenterOpen = false; Quickshell.execDetached(["hyprlock"]); } else { root.commandCenterOpen = false; Quickshell.execDetached(["sh", "-c", "mkdir -p ~/Pictures/Screenshots && file=~/Pictures/Screenshots/screenshot_$(date +%Y%m%d_%H%M%S).png; grim -g \"$(slurp)\" \"$file\" && wl-copy < \"$file\""]); } } } } }
                         }
                     }
                 }
 
-                // 5. Випливаючий Power Control Center справа
+                RectangularShadow {
+                    z: 4
+                    anchors.fill: controlCenterCard
+                    radius: controlCenterCard.radius
+                    blur: 30
+                    spread: 2
+                    offset.y: 9
+                    color: "#8C000000"
+                    opacity: controlCenterCard.pc
+                    visible: controlCenterCard.visible
+                }
+
+                // 5. Випливаючий Power Control Center справа.
+                // Same trick as the Command Centre, anchored to the power button
+                // instead: at progress 0 it is a 30x30 square sitting exactly on
+                // the 󰐥 glyph, hidden behind the opaque right-hand island.
                 Rectangle {
                     id: controlCenterCard
                     z: 5
+
+                    readonly property real p: root.powerProgress
+                    readonly property real pc: root.clamp01(root.powerProgress)
+
                     anchors.right: parent.right
-                    y: root.powerOpen ? 44 : 20
-                    width: 164
-                    height: 164
+                    anchors.rightMargin: 14 * (1 - pc)
+                    y: 2 + 42 * Math.max(0, p)
+                    width: 30 + 134 * p
+                    height: 30 + 134 * p
                     color: root.colBg
-                    radius: 12
+                    radius: 8 + 4 * pc
                     border.width: 1
                     border.color: root.colBorder
-                    opacity: root.powerOpen ? 1.0 : 0.0
-                    scale: root.powerOpen ? 1.0 : 0.82
-                    visible: opacity > 0.01
-                    transformOrigin: Item.TopRight
-
-                    Behavior on y {
-                        NumberAnimation {
-                            duration: 380
-                            easing.type: Easing.OutBack
-                            easing.overshoot: 2.2
-                        }
-                    }
-
-                    Behavior on opacity {
-                        NumberAnimation {
-                            duration: 180
-                            easing.type: Easing.OutQuad
-                        }
-                    }
-
-                    Behavior on scale {
-                        NumberAnimation {
-                            duration: 380
-                            easing.type: Easing.OutBack
-                            easing.overshoot: 2.4
-                        }
-                    }
+                    visible: p > 0.001
+                    clip: true
 
                     Grid {
                         id: grid
-                        anchors.fill: parent
-                        anchors.margins: 8
+                        // Pinned to the right inset, the edge the card grows out
+                        // of: that edge barely moves, so the tiles stay put while
+                        // the card expands leftwards instead of sliding with it.
+                        anchors.right: parent.right
+                        anchors.rightMargin: 8
+                        y: 8
+                        width: 148
                         columns: 2
                         spacing: 6
 
@@ -1313,6 +2081,8 @@ Scope {
                             height: 71
                             radius: 8
                             color: lockMouse.containsMouse ? root.colCardHover : root.colCard
+                            opacity: root.powerReveal(0)
+                            scale: 0.72 + 0.28 * root.powerReveal(0)
 
                             Behavior on color {
                                 ColorAnimation { duration: 150 }
@@ -1321,6 +2091,10 @@ Scope {
                             Column {
                                 anchors.centerIn: parent
                                 spacing: 4
+                                scale: lockMouse.containsMouse ? 1.1 : 1
+                                Behavior on scale {
+                                    NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.6 }
+                                }
 
                                 Text {
                                     text: "󰌾"
@@ -1355,6 +2129,8 @@ Scope {
                             height: 71
                             radius: 8
                             color: logoutMouse.containsMouse ? root.colCardHover : root.colCard
+                            opacity: root.powerReveal(1)
+                            scale: 0.72 + 0.28 * root.powerReveal(1)
 
                             Behavior on color {
                                 ColorAnimation { duration: 150 }
@@ -1363,6 +2139,10 @@ Scope {
                             Column {
                                 anchors.centerIn: parent
                                 spacing: 4
+                                scale: logoutMouse.containsMouse ? 1.1 : 1
+                                Behavior on scale {
+                                    NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.6 }
+                                }
 
                                 Text {
                                     text: "󰍃"
@@ -1397,6 +2177,8 @@ Scope {
                             height: 71
                             radius: 8
                             color: rebootMouse.containsMouse ? root.colCardHover : root.colCard
+                            opacity: root.powerReveal(1)
+                            scale: 0.72 + 0.28 * root.powerReveal(1)
 
                             Behavior on color {
                                 ColorAnimation { duration: 150 }
@@ -1405,6 +2187,10 @@ Scope {
                             Column {
                                 anchors.centerIn: parent
                                 spacing: 4
+                                scale: rebootMouse.containsMouse ? 1.1 : 1
+                                Behavior on scale {
+                                    NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.6 }
+                                }
 
                                 Text {
                                     text: "󰜉"
@@ -1439,6 +2225,8 @@ Scope {
                             height: 71
                             radius: 8
                             color: shutdownMouse.containsMouse ? "#802207" : root.colCard
+                            opacity: root.powerReveal(2)
+                            scale: 0.72 + 0.28 * root.powerReveal(2)
 
                             Behavior on color {
                                 ColorAnimation { duration: 150 }
@@ -1447,6 +2235,10 @@ Scope {
                             Column {
                                 anchors.centerIn: parent
                                 spacing: 4
+                                scale: shutdownMouse.containsMouse ? 1.1 : 1
+                                Behavior on scale {
+                                    NumberAnimation { duration: 240; easing.type: Easing.OutBack; easing.overshoot: 2.6 }
+                                }
 
                                 Text {
                                     text: "󰐥"
@@ -1503,6 +2295,13 @@ Scope {
             width: parent.width
             spacing: 8
 
+            // Only `y` is animated here: each card drives its own x/opacity/scale
+            // entrance and exit, so listing "x" would have the positioner and the
+            // card fighting over the same property.
+            move: Transition {
+                NumberAnimation { properties: "y"; duration: 340; easing.type: Easing.OutQuint }
+            }
+
             Repeater {
                 model: notificationServer.trackedNotifications
 
@@ -1516,23 +2315,79 @@ Scope {
                         if (closing) return;
                         expireAfterClose = expireNotification;
                         closing = true;
-                        closeAnimationTimer.restart();
+                        enterAnim.stop();
+                        lifeAnim.stop();
+                        exitAnim.start();
                     }
 
                     width: notificationColumn.width
                     height: 78
-                    x: closing ? width + 24 : 0
-                    opacity: closing ? 0 : 1
                     radius: 10
                     color: "#F01E1D1E"
                     border.width: 1
                     border.color: modelData.urgency === NotificationUrgency.Critical ? "#88C74028" : "#45FFFFFF"
 
-                    Behavior on x {
-                        NumberAnimation { duration: 260; easing.type: Easing.InCubic }
+                    // Starting values only — every one of these is handed over to
+                    // an animation, so none of them may be a live binding.
+                    x: notificationColumn.width + 30
+                    opacity: 0
+                    scale: 0.9
+
+                    Component.onCompleted: enterAnim.start()
+
+                    // A negative z puts the shadow behind the card's own fill.
+                    RectangularShadow {
+                        anchors.fill: parent
+                        z: -1
+                        radius: parent.radius
+                        blur: 24
+                        spread: 1
+                        offset.y: 7
+                        color: "#7A000000"
                     }
-                    Behavior on opacity {
-                        NumberAnimation { duration: 210; easing.type: Easing.InQuad }
+
+                    ParallelAnimation {
+                        id: enterAnim
+                        NumberAnimation {
+                            target: notificationCard; property: "x"; to: 0
+                            duration: 520; easing.type: Easing.OutBack; easing.overshoot: 1.5
+                        }
+                        NumberAnimation {
+                            target: notificationCard; property: "scale"; to: 1
+                            duration: 520; easing.type: Easing.OutBack; easing.overshoot: 2.4
+                        }
+                        NumberAnimation {
+                            target: notificationCard; property: "opacity"; to: 1
+                            duration: 220; easing.type: Easing.OutQuad
+                        }
+                    }
+
+                    SequentialAnimation {
+                        id: exitAnim
+                        ParallelAnimation {
+                            NumberAnimation {
+                                target: notificationCard; property: "x"
+                                to: notificationColumn.width + 34
+                                duration: 300; easing.type: Easing.InBack; easing.overshoot: 1.1
+                            }
+                            NumberAnimation {
+                                target: notificationCard; property: "scale"; to: 0.88
+                                duration: 300; easing.type: Easing.InQuad
+                            }
+                            NumberAnimation {
+                                target: notificationCard; property: "opacity"; to: 0
+                                duration: 260; easing.type: Easing.InQuad
+                            }
+                        }
+                        // Handing the notification back only once the card has
+                        // left the screen keeps the stack from snapping shut
+                        // underneath the animation.
+                        ScriptAction {
+                            script: {
+                                if (notificationCard.expireAfterClose) notificationCard.modelData.expire();
+                                else notificationCard.modelData.dismiss();
+                            }
+                        }
                     }
 
                     Rectangle {
@@ -1566,6 +2421,9 @@ Scope {
                         anchors.top: parent.top; anchors.topMargin: 9
                         text: "󰅖"; color: closeNotificationMouse.containsMouse ? "#FFFFFF" : "#777777"
                         font { family: "JetBrainsMono Nerd Font"; pixelSize: 12 }
+                        scale: closeNotificationMouse.pressed ? 0.8 : (closeNotificationMouse.containsMouse ? 1.25 : 1)
+                        Behavior on scale { NumberAnimation { duration: 220; easing.type: Easing.OutBack; easing.overshoot: 3.0 } }
+                        Behavior on color { ColorAnimation { duration: 140 } }
                         MouseArea { id: closeNotificationMouse; anchors.fill: parent; anchors.margins: -7; enabled: !notificationCard.closing; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: notificationCard.closeAnimated(false) }
                     }
                     MouseArea {
@@ -1581,13 +2439,31 @@ Scope {
                         running: true
                         onTriggered: notificationCard.closeAnimated(true)
                     }
-                    Timer {
-                        id: closeAnimationTimer
-                        interval: 270
-                        repeat: false
-                        onTriggered: {
-                            if (notificationCard.expireAfterClose) modelData.expire();
-                            else modelData.dismiss();
+
+                    // Time-left hairline along the bottom edge, draining on the
+                    // same clock as expiryTimer.
+                    Rectangle {
+                        id: lifeBar
+                        anchors.left: parent.left
+                        anchors.bottom: parent.bottom
+                        anchors.leftMargin: 2
+                        anchors.bottomMargin: 2
+                        height: 2
+                        radius: 1
+                        width: notificationCard.width - 4
+                        color: notificationCard.modelData.urgency === NotificationUrgency.Critical
+                            ? "#C74028"
+                            : "#40FFFFFF"
+
+                        Component.onCompleted: lifeAnim.start()
+
+                        NumberAnimation {
+                            id: lifeAnim
+                            target: lifeBar
+                            property: "width"
+                            to: 0
+                            duration: expiryTimer.interval
+                            easing.type: Easing.Linear
                         }
                     }
                 }
@@ -1595,3 +2471,6 @@ Scope {
         }
     }
 }
+
+
+
